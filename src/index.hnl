@@ -1,0 +1,944 @@
+--- http-static -- static file serving for handl HTTP servers.
+---
+--- Sits at the same layer as `http-route`'s handlers: `serve` hands the
+--- handler a parsed lib-http-rfc request record `{ method, target, path,
+--- query, version, headers, body, body_bytes }` and expects a response
+--- record `{ status?, headers?, body? | body_bytes? }` back.
+--- `static_files(root, opts?)` returns a `(req) ~> resp` handler —
+--- drop it into `serve` directly or adapt it into an
+--- `http-middleware` chain with `mw.end(static_files(...))`.
+---
+--- Path safety: `req.path` is percent-decoded, split into segments,
+--- and `.`/empty segments are dropped; ANY remaining `..` segment, a
+--- decoded NUL, or a malformed percent escape is rejected with 403
+--- before any filesystem call. The surviving segments are rejoined
+--- under `root`, so the resolved path cannot escape the root — there
+--- is no `..` left to climb with. (Residual gap: a symlink INSIDE the
+--- root pointing outside is followed by `stat`/`read_file`; v1 rejects
+--- only a final-component symlink when the fs port provides `lstat`.)
+---
+--- Filesystem access goes through an injectable port record so tests
+--- (and non-POSIX backends) never touch the real disk:
+---
+---   fs := { stat:      (path) ~> Stat,          -- raises on missing
+---           lstat:     (path) ~> Stat,          -- optional
+---           read_file: (path) ~> Bytes,
+---           list_dir:  (path) ~> [String],
+---           is_dir:    (path) ~> Bool,          -- soft probes
+---           is_file:   (path) ~> Bool }
+---
+--- The default is the `posix-c` module record (lib-posix-c), which
+--- satisfies the whole shape.
+---
+--- Responses:
+---   GET/HEAD  -> file bytes as `body_bytes` (binary-safe; `serve`
+---                strips the body for HEAD via `head_only` while keeping
+---                the real Content-Length). 304 on If-None-Match hit,
+---                206 on a satisfiable single `Range: bytes=` request,
+---                416 on an unsatisfiable one.
+---   other     -> 405 with `allow: GET, HEAD`.
+---   missing   -> 404; `..`/NUL/bad escape -> 403; directory without
+---                index and listing off -> 403; dotfile segment with
+---                `dotfiles: false` (default) -> 404.
+---
+--- Directory handling: a path resolving to a directory 301-redirects
+--- to `path + "/"` (query preserved) when the slash is missing, then
+--- serves `<dir>/<index>` (default `index.html`) when it is a file;
+--- with `listing: true` and no index it renders a minimal HTML index;
+--- otherwise 403.
+---
+--- Exports:
+---   static_files(root, opts?)  ~> (req) ~> resp
+---   mime_of(path)              ~> Content-Type string
+---   http_date(ms)             ~> IMF-fixdate string
+---   safe_rel(path)            ~> { segs } | { bad }   -- testable core
+
+-- NOTE: `str.*`, `bytes.*`, `char.*`, `hash_map.*`, `type.*`, `math.*`,
+-- `error.*`, `ffi.*` are host modules / registered wire names reached by
+-- qualified call with no import (importing "bytes"/"str" would resolve
+-- the sibling CONTRACT packages whose `op`/`axiom` fields are not
+-- first-class arrows in this dialect, and `posix-c`'s typed exports
+-- dispatch as unregistered host ops — so the fs port below calls libc
+-- through `ffi` directly, the same mechanism posix-c's fs.hnl uses).
+
+-- ---------------------------------------------------------------------
+-- built-in fs port: libc via ffi.call (linux x86_64 glibc; the
+-- posix-c fs.hnl layout, trimmed to the surface static_files needs)
+-- ---------------------------------------------------------------------
+
+LIBC := "libc.so.6"
+
+O_RDONLY := 0
+F_OK := 0
+EINTR := 4
+S_IFMT := 61440
+S_IFDIR := 16384
+S_IFREG := 32768
+S_IFLNK := 40960
+DIRENT_NAME_OFF := 19
+STAT_DESC := "out_struct:{st_dev:u64@0:8,st_ino:u64@8:8,st_nlink:u64@16:8,st_mode:u32@24:4,st_uid:u32@28:4,st_gid:u32@32:4,st_rdev:u64@40:8,st_size:i64@48:8,st_blksize:i64@56:8,st_blocks:i64@64:8,st_atime_sec:i64@72:8,st_atime_nsec:i64@80:8,st_mtime_sec:i64@88:8,st_mtime_nsec:i64@96:8,st_ctime_sec:i64@104:8,st_ctime_nsec:i64@112:8,__r0:i64@120:8,__r1:i64@128:8,__r2:i64@136:8}"
+
+fs_strerror := (n) ~> do {
+  s := ffi.call(LIBC, "strerror", [n], ["i32"], "cstr", false)
+  if s == null { "errno " + type.to_string(n) } else { s }
+}
+
+fs_err := (what) ~> do {
+  e := ffi.errno()
+  error.raise("http-static fs: " + what + ": " + fs_strerror(e))
+}
+
+c_open := (path, flags, mode) ~>
+  ffi.call(LIBC, "open", [path, flags, mode],
+    ["cstr", "i32", "i32"], "i32", false)
+
+c_close := (fd) ~>
+  ffi.call(LIBC, "close", [fd], ["i32"], "i32", false)
+
+read_all := (fd) ~> while { acc: bytes.from_list([]), bad: 0 } {
+  (acc, bad) ~> if bad != 0 {
+    { out: { data: acc, bad: bad } }
+  } else {
+    do {
+      r := ffi.call(LIBC, "read", [fd],
+        ["i32", "out_buf:65536"], "i64", false)
+      if r.ret > 0 {
+        { state: { acc: bytes.concat(acc, r.buf), bad: 0 } }
+      } else if r.ret == 0 {
+        { out: { data: acc, bad: 0 } }
+      } else {
+        do {
+          e := ffi.errno()
+          if e == EINTR {
+            { state: { acc: acc, bad: 0 } }
+          } else {
+            { out: { data: acc, bad: e } }
+          }
+        }
+      }
+    }
+  }
+}
+
+dir_collect := (d) ~> while { names: [], eof: false } {
+  (names, eof) ~> if eof {
+    { out: names }
+  } else {
+    do {
+      e := ffi.call(LIBC, "readdir", [d], ["ptr"], "ptr", false)
+      if e == 0 {
+        { state: { names: names, eof: true } }
+      } else {
+        do {
+          nm := ffi.read(e + DIRENT_NAME_OFF, "cstr")
+          if nm == "." || nm == ".." {
+            { state: { names: names, eof: false } }
+          } else {
+            { state: { names: [...names, nm], eof: false } }
+          }
+        }
+      }
+    }
+  }
+}
+
+stat_maybe := (path, sym) ~> do {
+  s := ffi.call(LIBC, sym, [path], ["cstr", STAT_DESC], "i32", false)
+  if s.ret != 0 {
+    null
+  } else {
+    do {
+      b := s.buf
+      { size: b.st_size,
+        mode: b.st_mode,
+        is_dir: math.bit_and(b.st_mode, S_IFMT) == S_IFDIR,
+        is_file: math.bit_and(b.st_mode, S_IFMT) == S_IFREG,
+        is_symlink: math.bit_and(b.st_mode, S_IFMT) == S_IFLNK,
+        mtime_ms: b.st_mtime_sec * 1000
+          + math.floor_div(b.st_mtime_nsec, 1000000) }
+    }
+  }
+}
+
+fs_read_file := (path) ~> do {
+  fd := c_open(path, O_RDONLY, 0)
+  if fd < 0 {
+    fs_err("read_file(" + path + "): open")
+  } else {
+    do {
+      r := read_all(fd)
+      _ := c_close(fd)
+      if r.bad != 0 {
+        error.raise("http-static fs: read_file(" + path + "): read: "
+          + fs_strerror(r.bad))
+      } else {
+        r.data
+      }
+    }
+  }
+}
+
+fs_list_dir := (path) ~> do {
+  d := ffi.call(LIBC, "opendir", [path], ["cstr"], "ptr", false)
+  if d == 0 {
+    fs_err("list_dir(" + path + "): opendir")
+  } else {
+    do {
+      names := dir_collect(d)
+      _ := ffi.call(LIBC, "closedir", [d], ["ptr"], "i32", false)
+      names
+    }
+  }
+}
+
+fs_stat := (path) ~> do {
+  s := stat_maybe(path, "stat")
+  if s == null { fs_err("stat(" + path + ")") } else { s }
+}
+
+fs_lstat := (path) ~> do {
+  s := stat_maybe(path, "lstat")
+  if s == null { fs_err("lstat(" + path + ")") } else { s }
+}
+
+fs_path_exists := (path) ~> do {
+  r := ffi.call(LIBC, "access", [path, F_OK], ["cstr", "i32"], "i32",
+    false)
+  r == 0
+}
+
+--- the built-in fs port record (same shape the `fs` opt documents);
+--- exported for tests and for callers that want to wrap/extend it.
+export default_fs := {
+  stat: fs_stat,
+  lstat: fs_lstat,
+  read_file: fs_read_file,
+  list_dir: fs_list_dir,
+  path_exists: fs_path_exists,
+  is_dir: (p) ~> do {
+    s := stat_maybe(p, "stat")
+    if s == null { false } else { s.is_dir }
+  },
+  is_file: (p) ~> do {
+    s := stat_maybe(p, "stat")
+    if s == null { false } else { s.is_file }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- small helpers (same shapes as http-middleware's private ones)
+-- ---------------------------------------------------------------------
+
+is_obj   := (v) ~> type.of(v) == "object"
+is_arr   := (v) ~> type.of(v) == "array"
+is_str   := (v) ~> type.of(v) == "string"
+
+opts_of := (o, d) ~> if is_obj(o) { o } else { d }
+opt     := (o, k, d) ~> hash_map.get_or(o, k, d)
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+--- fold `[[k, v], ...]` pairs into a headers record.
+put_hs := (hs, pairs) ~> while { xs: pairs, acc: hs } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [[k, v], ...t]: { state: { xs: t, acc: hash_map.set(acc, k, v) } }
+  }
+}
+
+--- merge `[[k, v], ...]` pairs into resp.headers (right wins).
+with_headers := (resp, pairs) ~> do {
+  if alen(pairs) == 0 {
+    resp
+  } else {
+    hs := hash_map.get_or(resp, "headers", {})
+    hash_map.merge(resp, { headers: put_hs(hs, pairs) })
+  }
+}
+
+--- first `...rest` variadic tail element, or null.
+rest0 := (rest) ~> match rest {
+  [h, ..._t]: h,
+  []: null
+}
+
+-- ---------------------------------------------------------------------
+-- percent decoding / path normalization
+-- ---------------------------------------------------------------------
+
+hexval := (c) ~> do {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    -1
+  }
+}
+
+--- percent-decode a path string to Bytes. Returns { data, bad } —
+--- `bad` is true on a truncated/invalid %XX escape; the caller maps it
+--- to 400. Decoding happens on BYTES so %2F/%2E/%00 all surface before
+--- any segment logic sees them.
+pct_decode := (s) ~> do {
+  b := bytes.utf8_encode(s)
+  n := bytes.len(b)
+  while { i: 0, acc: bytes.from_list([]), bad: false } {
+    (st) ~> if st.i >= n {
+      { out: { data: st.acc, bad: st.bad } }
+    } else {
+      do {
+        c := bytes.at(b, st.i)
+        if c == 37 {
+          if st.i + 2 < n {
+            do {
+              h := hexval(bytes.at(b, st.i + 1))
+              l := hexval(bytes.at(b, st.i + 2))
+              if h < 0 || l < 0 {
+                { state: { i: st.i + 1,
+                  acc: bytes.concat(st.acc, bytes.slice(b, st.i, 1)),
+                  bad: true } }
+              } else {
+                { state: { i: st.i + 3,
+                  acc: bytes.concat(st.acc,
+                    bytes.from_list([h * 16 + l])),
+                  bad: st.bad } }
+              }
+            }
+          } else {
+            -- truncated escape at end of path
+            { state: { i: st.i + 1,
+              acc: bytes.concat(st.acc, bytes.slice(b, st.i, 1)),
+              bad: true } }
+          }
+        } else {
+          { state: { i: st.i + 1,
+            acc: bytes.concat(st.acc, bytes.slice(b, st.i, 1)),
+            bad: st.bad } }
+        }
+      }
+    }
+  }
+}
+
+--- split a decoded path on "/", drop "" and "." segments, flag any
+--- ".." segment. Returns { segs, bad }.
+clean_segments := (decoded) ~> while {
+  xs: str.split(decoded, "/"), segs: [], bad: false } {
+  (xs, segs, bad) ~> match xs {
+    []: { out: { segs: segs, bad: bad } },
+    [s, ...t]: if bad {
+      { out: { segs: segs, bad: true } }
+    } else if s == "" || s == "." {
+      { state: { xs: t, segs: segs, bad: false } }
+    } else if s == ".." {
+      { out: { segs: segs, bad: true } }
+    } else {
+      { state: { xs: t, segs: [...segs, s], bad: false } }
+    }
+  }
+}
+
+--- the confinement core, exported for tests: percent-decode `path`,
+--- normalize segments, reject traversal. Returns
+---   { ok: true,  segs: [String] }   -- safe relative segments
+---   { ok: false, code: 400|403 }    -- bad escape or `..`/NUL
+export safe_rel := (path) ~> do {
+  d := pct_decode(path)
+  if d.bad {
+    { ok: false, code: 400 }
+  } else {
+    do {
+      dec := bytes.utf8_decode(d.data)
+      if str.find(dec, char.from_code_point(0)) >= 0 {
+        { ok: false, code: 403 }
+      } else {
+        do {
+          c := clean_segments(dec)
+          if c.bad {
+            { ok: false, code: 403 }
+          } else {
+            { ok: true, segs: c.segs }
+          }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- mime types / dates
+-- ---------------------------------------------------------------------
+
+--- last path segment.
+base_of := (p) ~> do {
+  i := str.rfind(p, "/")
+  if i >= 0 { str.slice(p, i + 1, str.length(p)) } else { p }
+}
+
+--- file extension including the dot, lowercased, "" when absent.
+ext_of := (p) ~> do {
+  b := base_of(p)
+  i := str.rfind(b, ".")
+  if i > 0 {
+    str.lower(str.slice(b, i, str.length(b)))
+  } else {
+    ""
+  }
+}
+
+mime_table := {
+  ".html": "text/html; charset=utf-8",
+  ".htm":  "text/html; charset=utf-8",
+  ".css":  "text/css; charset=utf-8",
+  ".js":   "text/javascript; charset=utf-8",
+  ".mjs":  "text/javascript; charset=utf-8",
+  ".json": "application/json",
+  ".map":  "application/json",
+  ".txt":  "text/plain; charset=utf-8",
+  ".md":   "text/markdown; charset=utf-8",
+  ".png":  "image/png",
+  ".jpg":  "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif":  "image/gif",
+  ".webp": "image/webp",
+  ".svg":  "image/svg+xml",
+  ".ico":  "image/x-icon",
+  ".wasm": "application/wasm",
+  ".pdf":  "application/pdf",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".webmanifest": "application/manifest+json"
+}
+
+--- Content-Type for a path; application/octet-stream when unknown.
+export mime_of := (path) ~> hash_map.get_or(mime_table, ext_of(path),
+  "application/octet-stream")
+
+pad2 := (n) ~> if n < 10 {
+  "0" + type.to_string(n)
+} else {
+  type.to_string(n)
+}
+
+--- ms since epoch -> "Sun, 06 Nov 1994 08:49:37 GMT" (IMF-fixdate).
+export http_date := (ms) ~> do {
+  secs := math.floor_div(ms, 1000)
+  days := math.floor_div(secs, 86400)
+  sod := secs - days * 86400
+  hh := math.floor_div(sod, 3600)
+  mm := math.floor_div(sod - hh * 3600, 60)
+  ss := sod - hh * 3600 - mm * 60
+  -- civil-from-days (Howard Hinnant's algorithm, integer only)
+  z := days + 719468
+  era := math.floor_div(z, 146097)
+  doe := z - era * 146097
+  yoe := math.floor_div(doe - math.floor_div(doe, 1460)
+    + math.floor_div(doe, 36524) - math.floor_div(doe, 146096), 365)
+  y := yoe + era * 400
+  doy := doe - (365 * yoe + math.floor_div(yoe, 4)
+    - math.floor_div(yoe, 100))
+  mp := math.floor_div(5 * doy + 2, 153)
+  d := doy - math.floor_div(153 * mp + 2, 5) + 1
+  m := mp + (if mp < 10 { 3 } else { -9 })
+  yr := y + (if m <= 2 { 1 } else { 0 })
+  -- 1970-01-01 was a Thursday; (days + 4) mod 7 -> 0 = Sunday
+  w := (days + 4) - math.floor_div(days + 4, 7) * 7
+  dows := ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+  mons := ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  dows[w] + ", " + pad2(d) + " " + mons[m - 1] + " "
+    + type.to_string(yr) + " " + pad2(hh) + ":" + pad2(mm) + ":"
+    + pad2(ss) + " GMT"
+}
+
+-- ---------------------------------------------------------------------
+-- etag / conditional requests
+-- ---------------------------------------------------------------------
+
+--- quoted etag core from stat: "<mtime_ms>-<size>".
+etag_core := (st) ~> "\"" + type.to_string(hash_map.get_or(st, "mtime_ms", 0))
+  + "-" + type.to_string(hash_map.get_or(st, "size", 0)) + "\""
+
+--- strip a leading weak-validator marker for comparison.
+unweak := (t) ~> if str.starts_with(t, "W/") {
+  str.slice(t, 2, str.length(t))
+} else {
+  t
+}
+
+--- does an If-None-Match header value match our etag core?
+--- Handles comma lists, weak prefixes and "*".
+inm_match := (hdr, core) ~> while {
+  xs: str.split(hdr, ","), hit: false } {
+  (xs, hit) ~> match xs {
+    []: { out: hit },
+    [s, ...t]: if hit {
+      { out: true }
+    } else {
+      do {
+        v := unweak(str.trim(s))
+        if v == "*" || v == core {
+          { out: true }
+        } else {
+          { state: { xs: t, hit: false } }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- Range requests
+-- ---------------------------------------------------------------------
+
+--- digit string -> Int, -1 on any non-digit.
+to_int := (s) ~> do {
+  n := str.length(s)
+  while { i: 0, acc: 0, bad: false } {
+    (i, acc, bad) ~> if i >= n {
+      { out: if bad { -1 } else { acc } }
+    } else {
+      do {
+        c := char.code_point_at(s, i)
+        if c >= 48 && c <= 57 {
+          { state: { i: i + 1, acc: acc * 10 + c - 48, bad: bad } }
+        } else {
+          { state: { i: i + 1, acc: acc, bad: true } }
+        }
+      }
+    }
+  }
+}
+
+--- parse `Range: bytes=a-b` against `size`. Returns
+---   { ok: true, start, end }   -- inclusive byte range to serve
+---   { ok: false }              -- syntactically fine but unsatisfiable (416)
+---   null                       -- header absent/unsupported: serve 200
+parse_range := (hdr, size) ~> do {
+  if str.starts_with(hdr, "bytes=") == false {
+    null
+  } else {
+    do {
+      rest := str.slice(hdr, 6, str.length(hdr))
+      -- multipart ranges are out of scope: ignore, serve the whole file
+      if str.find(rest, ",") >= 0 {
+        null
+      } else {
+        do {
+          i := str.find(rest, "-")
+          if i < 0 {
+            null
+          } else {
+            do {
+              a := str.trim(str.slice(rest, 0, i))
+              b := str.trim(str.slice(rest, i + 1,
+                str.length(rest)))
+              if a == "" && b == "" {
+                null
+              } else if a == "" {
+                do {
+                  n := to_int(b)
+                  if n <= 0 {
+                    { ok: false }
+                  } else {
+                    { ok: true,
+                      start: (if size - n > 0 { size - n } else { 0 }),
+                      end: size - 1 }
+                  }
+                }
+              } else {
+                do {
+                  st := to_int(a)
+                  if st < 0 || st >= size {
+                    { ok: false }
+                  } else {
+                    do {
+                      en := if b == "" {
+                        size - 1
+                      } else {
+                        e0 := to_int(b)
+                        if e0 < 0 { -1 } else { e0 }
+                      }
+                      if en < 0 {
+                        null
+                      } else {
+                        do {
+                          en2 := if en > size - 1 { size - 1 } else { en }
+                          if en2 < st {
+                            { ok: false }
+                          } else {
+                            { ok: true, start: st, end: en2 }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- directory listing
+-- ---------------------------------------------------------------------
+
+--- HTML-escape & < > ". NOTE: not `str.replace` — the wire `str.replace`
+--- reverses replacement strings of length >= 3 (platform bug), so the
+--- escape is built char-by-char.
+esc_html := (s) ~> while { i: 0, acc: "" } {
+  (st) ~> if st.i >= str.length(s) {
+    { out: st.acc }
+  } else {
+    do {
+      c := str.char_at(s, st.i)
+      e := if c == "&" {
+        "&amp;"
+      } else if c == "<" {
+        "&lt;"
+      } else if c == ">" {
+        "&gt;"
+      } else if c == "\"" {
+        "&quot;"
+      } else {
+        c
+      }
+      { state: { i: st.i + 1, acc: st.acc + e } }
+    }
+  }
+}
+
+hexch := (v) ~> char.from_code_point(
+  if v < 10 { 48 + v } else { 55 + v })
+
+--- percent-encode one path segment for use in an href. Output is pure
+--- ASCII (unreserved bytes pass through, everything else becomes %XX of
+--- its UTF-8 bytes), accumulated as Bytes then decoded once.
+pct_seg := (s) ~> do {
+  b := bytes.utf8_encode(s)
+  n := bytes.len(b)
+  while { i: 0, acc: bytes.from_list([]) } {
+    (st) ~> if st.i >= n {
+      { out: bytes.utf8_decode(st.acc) }
+    } else {
+      do {
+        c := bytes.at(b, st.i)
+        okc := (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+          || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95
+          || c == 126
+        chunk := if okc {
+          bytes.slice(b, st.i, 1)
+        } else {
+          bytes.utf8_encode("%" + hexch(math.floor_div(c, 16))
+            + hexch(c - math.floor_div(c, 16) * 16))
+        }
+        { state: { i: st.i + 1,
+          acc: bytes.concat(st.acc, chunk) } }
+      }
+    }
+  }
+}
+
+--- lexicographic string less-than over char code points (the `<=`
+--- operator is numeric-only in this runtime).
+str_lt := (a, b) ~> do {
+  na := str.length(a)
+  nb := str.length(b)
+  while { i: 0, lt: false, gt: false, done: false } {
+    (st) ~> if st.done || st.i >= na || st.i >= nb {
+      { out: if st.lt {
+        true
+      } else if st.gt {
+        false
+      } else {
+        na < nb
+      } }
+    } else {
+      do {
+        ca := char.code_point_at(a, st.i)
+        cb := char.code_point_at(b, st.i)
+        { state: { i: st.i + 1, done: ca != cb,
+          lt: ca < cb, gt: ca > cb } }
+      }
+    }
+  }
+}
+
+--- insertion-sort a list of names (ascending).
+sort_names := (xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: do {
+      ins := while { xs: out, v: h, acc: [] } {
+        (xs, v, acc) ~> match xs {
+          []: { out: [...acc, v] },
+          [x, ...xt]: if str_lt(x, v) || x == v {
+            { state: { xs: xt, v: v, acc: [...acc, x] } }
+          } else {
+            { out: [...acc, v, ...xs] }
+          }
+        }
+      }
+      { state: { xs: t, out: ins } }
+    }
+  }
+}
+
+--- minimal HTML index for a directory. `base` is the request path
+--- (already slash-terminated); `names` the list_dir result; `isdirf`
+--- maps a name to Bool.
+listing_html := (base, names, isdirf) ~> do {
+  sorted := sort_names(names)
+  rows := while { xs: sorted, acc: [] } {
+    (xs, acc) ~> match xs {
+      []: { out: acc },
+      [nm, ...t]: do {
+        d := isdirf(nm)
+        href := pct_seg(nm) + (if d { "/" } else { "" })
+        label := esc_html(nm) + (if d { "/" } else { "" })
+        { state: { xs: t,
+          acc: [...acc, "<li><a href=\"" + href + "\">" + label
+            + "</a></li>"] } }
+      }
+    }
+  }
+  "<!doctype html>\n<html><head><meta charset=\"utf-8\">"
+    + "<title>Index of " + esc_html(base) + "</title></head><body>"
+    + "<h1>Index of " + esc_html(base) + "</h1><ul>"
+    + str.join(rows, "\n") + "</ul></body></html>\n"
+}
+
+-- ---------------------------------------------------------------------
+-- static_files
+-- ---------------------------------------------------------------------
+
+--- static_files(root, opts?) -> (req) ~> resp.
+---
+--- opts (all optional):
+---   fs        fs port record (see module doc); default is the
+---             built-in libc/ffi backend (`default_fs` above)
+---   index     directory index file name, default "index.html"
+---   listing   Bool, default false — render an HTML index for
+---             directories with no index file
+---   dotfiles  Bool, default false — serve segments starting with "."
+---   headers   record merged into every file response's headers
+export static_files := (root, ...rest) ~> do {
+  o := opts_of(rest0(rest), {})
+  fs      := opt(o, "fs", default_fs)
+  index_n := opt(o, "index", "index.html")
+  listing := opt(o, "listing", false) == true
+  dotfiles := opt(o, "dotfiles", false) == true
+  xheaders := opt(o, "headers", {})
+
+  if is_str(root) == false {
+    error.raise("http-static: root must be a path string")
+  } else if is_obj(fs) == false {
+    error.raise("http-static: fs must be a port record { stat, " +
+      "read_file, list_dir, is_dir, is_file }")
+  } else {
+    do {
+      statf  := hash_map.get_or(fs, "stat", null)
+      readf  := hash_map.get_or(fs, "read_file", null)
+      listf  := hash_map.get_or(fs, "list_dir", null)
+      isdf   := hash_map.get_or(fs, "is_dir", null)
+      isff   := hash_map.get_or(fs, "is_file", null)
+      lstaf  := hash_map.get_or(fs, "lstat", null)
+      if type.of(statf) != "arrow" || type.of(readf) != "arrow"
+        || type.of(listf) != "arrow" || type.of(isdf) != "arrow"
+        || type.of(isff) != "arrow" {
+        error.raise("http-static: fs port needs stat/read_file/" +
+          "list_dir/is_dir/is_file arrows")
+      } else {
+        do {
+          -- strip trailing slashes off root once
+          rootc := while { p: root } {
+            (st) ~> if str.length(st.p) > 1
+              && str.ends_with(st.p, "/") {
+              { state: { p: str.slice(st.p, 0,
+                str.length(st.p) - 1) } }
+            } else {
+              { out: st.p }
+            }
+          }
+
+          join_fs := (rel) ~> if rel == "" {
+            rootc
+          } else {
+            rootc + "/" + rel
+          }
+
+          join_seg := (dir, name) ~> dir + "/" + name
+
+          has_dotseg := (segs) ~> while { xs: segs, hit: false } {
+            (xs, hit) ~> match xs {
+              []: { out: hit },
+              [s, ...t]: if hit || str.starts_with(s, ".") {
+                { out: true }
+              } else {
+                { state: { xs: t, hit: false } }
+              }
+            }
+          }
+
+          rel_of := (segs) ~> str.join(segs, "/")
+
+          is_link := (p) ~> if type.of(lstaf) == "arrow" {
+            do {
+              st := lstaf(p)
+              hash_map.get_or(st, "is_symlink", false) == true
+            }
+          } else {
+            false
+          }
+
+          --- serve one regular file at fs-path `fp` (request path
+          --- `urlp` for redirects/listing bases).
+          serve_file := (fp, urlp, req) ~> do {
+            if is_link(fp) {
+              { status: 403, body: "forbidden" }
+            } else {
+            meta := statf(fp)
+            size := hash_map.get_or(meta, "size", 0)
+            mtime := hash_map.get_or(meta, "mtime_ms", 0)
+            core := etag_core(meta)
+            etag := "W/" + core
+            lm := http_date(mtime)
+            base_hs := [
+              ["content-type", mime_of(fp)],
+              ["last-modified", lm],
+              ["etag", etag],
+              ["accept-ranges", "bytes"],
+              ["cache-control", "no-cache"]
+            ]
+            -- user-supplied `headers` opt merges into every file
+            -- response (right-wins over the standard set).
+            hs_base := hash_map.merge(put_hs({}, base_hs), xheaders)
+            inm := hash_map.get_or(
+              hash_map.get_or(req, "headers", {}),
+              "if-none-match", null)
+            fresh := is_str(inm) && inm_match(inm, core)
+            if fresh {
+              { status: 304,
+                headers: hs_base,
+                body: "" }
+            } else {
+              do {
+                rg := parse_range(
+                  hash_map.get_or(
+                    hash_map.get_or(req, "headers", {}),
+                    "range", ""),
+                  size)
+                if rg != null && hash_map.get_or(rg, "ok", true) == false {
+                  { status: 416,
+                    headers: put_hs({}, [
+                      ["content-range", "bytes */" + type.to_string(size)],
+                      ["content-type", "text/plain; charset=utf-8"]]),
+                    body: "range not satisfiable" }
+                } else if rg != null {
+                  do {
+                    stt := hash_map.get_or(rg, "start", 0)
+                    enn := hash_map.get_or(rg, "end", size - 1)
+                    data := readf(fp)
+                    { status: 206,
+                      headers: hash_map.merge(hs_base, {
+                        "content-range":
+                          "bytes " + type.to_string(stt) + "-"
+                            + type.to_string(enn) + "/"
+                            + type.to_string(size) }),
+                      body_bytes: bytes.slice(data, stt, enn - stt + 1) }
+                  }
+                } else {
+                  { status: 200,
+                    headers: hs_base,
+                    body_bytes: readf(fp) }
+                }
+              }
+            }
+            }
+          }
+
+          (req) ~> do {
+            m := hash_map.get_or(req, "method", "")
+            if m != "GET" && m != "HEAD" {
+              { status: 405,
+                headers: put_hs({}, [["allow", "GET, HEAD"]]),
+                body: "method not allowed" }
+            } else {
+              do {
+                p := hash_map.get_or(req, "path", "/")
+                sr := safe_rel(p)
+                if sr.ok == false {
+                  { status: hash_map.get_or(sr, "code", 403),
+                    body: "forbidden" }
+                } else {
+                  do {
+                    segs := hash_map.get_or(sr, "segs", [])
+                    if dotfiles == false && has_dotseg(segs) {
+                      { status: 404, body: "not found" }
+                    } else {
+                      do {
+                        rel := rel_of(segs)
+                        fp := join_fs(rel)
+                        if isff(fp) {
+                          serve_file(fp, p, req)
+                        } else if isdf(fp) {
+                          do {
+                            slash := str.ends_with(p, "/")
+                            q := hash_map.get_or(req, "query", "")
+                            if slash == false && rel != "" {
+                              { status: 301,
+                                headers: put_hs({}, [["location",
+                                  p + "/" + (if q == "" {
+                                    "" } else { "?" + q })]]),
+                                body: "" }
+                            } else {
+                              do {
+                                ip := join_seg(fp, index_n)
+                                if isff(ip) {
+                                  serve_file(ip, p, req)
+                                } else if listing {
+                                  do {
+                                    names := listf(fp)
+                                    isdirf := (nm) ~> isdf(
+                                      join_seg(fp, nm))
+                                    { status: 200,
+                                      headers: put_hs({}, [
+                                        ["content-type",
+                                          "text/html; charset=utf-8"]]),
+                                      body: listing_html(
+                                        p + (if slash { "" } else { "/" }),
+                                        names, isdirf) }
+                                  }
+                                } else {
+                                  { status: 403, body: "forbidden" }
+                                }
+                              }
+                            }
+                          }
+                        } else {
+                          { status: 404, body: "not found" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

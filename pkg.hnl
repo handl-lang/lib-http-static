@@ -1,0 +1,3 @@
+-- lib-http-static: modules this package provides (entry defaults to
+-- src/index.hnl; N modules resolve to src/<name>/index.hnl).
+{ modules: ["http-static"], name: "http-static", description: "Static file serving for handl HTTP servers: traversal-safe path confinement, Content-Type by extension, Content-Length/Last-Modified/ETag (If-None-Match -> 304), Accept-Ranges + Range -> 206/416, HEAD, index.html resolution, opt-in directory listing, 404/403 distinction.", license: "MIT", keywords: ["http", "static", "files", "serve", "stdlib", "handl"], homepage: "https://github.com/handl-lang/lib-http-static" }

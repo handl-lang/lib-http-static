@@ -1,0 +1,449 @@
+--- http-static.test -- coverage for the static file handler
+--- (`src/index.hnl`): path confinement (traversal, percent-decoding,
+--- dotfiles), mime types, index resolution, directory redirect +
+--- listing, 404/403/405, ETag/If-None-Match -> 304, Range -> 206/416,
+--- HEAD, and the injectable fs port (in-memory fixture, no disk).
+
+from "./index" import * as sf
+-- str.*/bytes.*/hash_map.* are registered wire names — no import needed
+-- (importing "bytes"/"str" here would bind the sibling contract
+-- packages, whose fields are not callable arrows in this dialect).
+
+-- ---------------------------------------------------------------------
+-- fixtures: an in-memory fs port
+-- ---------------------------------------------------------------------
+
+files := {
+  "/srv/www/index.html": { data: "<h1>hi</h1>", mtime_ms: 1000 },
+  "/srv/www/a b.txt":    { data: "space file", mtime_ms: 2000 },
+  "/srv/www/app.js":     { data: "console.log(1)", mtime_ms: 3000 },
+  "/srv/www/logo.png":   { data: "PNG", mtime_ms: 4000 },
+  "/srv/www/hello.txt":  { data: "hello world", mtime_ms: 5000 },
+  "/srv/www/.hidden":    { data: "shh", mtime_ms: 6000 },
+  "/srv/www/sub/index.html": { data: "<h1>sub</h1>", mtime_ms: 7000 },
+  "/srv/www/sub/deep.txt":   { data: "deep", mtime_ms: 8000 }
+}
+
+dirs := {
+  "/srv/www": ["index.html", "a b.txt", "app.js", "logo.png",
+               "hello.txt", ".hidden", "sub"],
+  "/srv/www/sub": ["index.html", "deep.txt"]
+}
+
+fs_stat := (p) ~> do {
+  if hash_map.has(files, p) {
+    f := files[p]
+    { size: bytes.len(bytes.utf8_encode(f.data)),
+      mtime_ms: f.mtime_ms, is_file: true, is_dir: false,
+      is_symlink: false }
+  } else if hash_map.has(dirs, p) {
+    { size: 0, mtime_ms: 0, is_file: false, is_dir: true,
+      is_symlink: false }
+  } else {
+    error.raise("fs: stat(" + p + "): no such file")
+  }
+}
+
+fake_fs := {
+  stat: fs_stat,
+  read_file: (p) ~> do {
+    if hash_map.has(files, p) {
+      bytes.utf8_encode(files[p].data)
+    } else {
+      error.raise("fs: read_file(" + p + "): no such file")
+    }
+  },
+  list_dir: (p) ~> do {
+    if hash_map.has(dirs, p) {
+      dirs[p]
+    } else {
+      error.raise("fs: list_dir(" + p + "): no such dir")
+    }
+  },
+  is_dir: (p) ~> hash_map.has(dirs, p),
+  is_file: (p) ~> hash_map.has(files, p)
+}
+
+handler := sf.static_files("/srv/www", { fs: fake_fs })
+
+mkreq := (m, p) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }
+}
+
+mkreqh := (m, p, hs) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: hs, body: "", body_bytes: null }
+}
+
+geth := (resp, k) ~> hash_map.get_or(
+  hash_map.get_or(resp, "headers", {}), k, null)
+
+body := (resp) ~> do {
+  bb := hash_map.get_or(resp, "body_bytes", null)
+  if bb != null {
+    bytes.utf8_decode(bb)
+  } else {
+    hash_map.get_or(resp, "body", "")
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- safe_rel: percent-decoding + segment normalization
+-- ---------------------------------------------------------------------
+
+test_safe_rel_plain := assert sf.safe_rel("/a/b/c.txt") =
+  { ok: true, segs: ["a", "b", "c.txt"] }
+
+test_safe_rel_dot_segments := assert sf.safe_rel("/a/./b//c") =
+  { ok: true, segs: ["a", "b", "c"] }
+
+test_safe_rel_traversal := assert sf.safe_rel("/../etc/passwd") =
+  { ok: false, code: 403 }
+
+test_safe_rel_nested_traversal := assert sf.safe_rel("/a/../../b") =
+  { ok: false, code: 403 }
+
+test_safe_rel_encoded_traversal := assert sf.safe_rel(
+  "/a/%2e%2e/%2E%2E/b") = { ok: false, code: 403 }
+
+test_safe_rel_encoded_slash := assert sf.safe_rel("/a%2Fb/c") =
+  { ok: true, segs: ["a", "b", "c"] }
+
+test_safe_rel_encoded_dotfile := assert sf.safe_rel("/%2ehidden") =
+  { ok: true, segs: [".hidden"] }
+
+test_safe_rel_nul := assert sf.safe_rel("/a%00b") =
+  { ok: false, code: 403 }
+
+test_safe_rel_bad_escape := assert sf.safe_rel("/a%zz") =
+  { ok: false, code: 400 }
+
+test_safe_rel_truncated_escape := assert sf.safe_rel("/a%2") =
+  { ok: false, code: 400 }
+
+test_safe_rel_root := assert sf.safe_rel("/") =
+  { ok: true, segs: [] }
+
+-- ---------------------------------------------------------------------
+-- mime_of / http_date
+-- ---------------------------------------------------------------------
+
+test_mime_html := assert sf.mime_of("/x/index.html") =
+  "text/html; charset=utf-8"
+
+test_mime_js := assert sf.mime_of("/x/app.js") =
+  "text/javascript; charset=utf-8"
+
+test_mime_png := assert sf.mime_of("/x/logo.PNG") = "image/png"
+
+test_mime_wasm := assert sf.mime_of("/x/mod.wasm") = "application/wasm"
+
+test_mime_unknown := assert sf.mime_of("/x/blob.bin") =
+  "application/octet-stream"
+
+test_mime_no_ext := assert sf.mime_of("/x/Makefile") =
+  "application/octet-stream"
+
+test_http_date_epoch := assert sf.http_date(0) =
+  "Thu, 01 Jan 1970 00:00:00 GMT"
+
+test_http_date_known := assert sf.http_date(784111777000) =
+  "Sun, 06 Nov 1994 08:49:37 GMT"
+
+-- ---------------------------------------------------------------------
+-- file serving
+-- ---------------------------------------------------------------------
+
+test_get_file := assert do {
+  r := handler(mkreq("GET", "/hello.txt"))
+  r.status == 200 &&
+  body(r) == "hello world" &&
+  geth(r, "content-type") == "text/plain; charset=utf-8" &&
+  geth(r, "accept-ranges") == "bytes" &&
+  geth(r, "etag") != null &&
+  geth(r, "last-modified") == "Thu, 01 Jan 1970 00:00:05 GMT"
+}
+
+test_get_html := assert do {
+  r := handler(mkreq("GET", "/index.html"))
+  r.status == 200 && body(r) == "<h1>hi</h1>" &&
+  geth(r, "content-type") == "text/html; charset=utf-8"
+}
+
+test_get_js_mime := assert do {
+  r := handler(mkreq("GET", "/app.js"))
+  r.status == 200 && geth(r, "content-type") ==
+    "text/javascript; charset=utf-8"
+}
+
+test_get_png_mime := assert do {
+  r := handler(mkreq("GET", "/logo.png"))
+  r.status == 200 && geth(r, "content-type") == "image/png"
+}
+
+test_head_request := assert do {
+  r := handler(mkreq("HEAD", "/hello.txt"))
+  -- serve strips the body via head_only; the handler still reports
+  -- the file bytes so Content-Length serializes correctly.
+  r.status == 200 && body(r) == "hello world"
+}
+
+test_post_405 := assert do {
+  r := handler(mkreq("POST", "/hello.txt"))
+  r.status == 405 && geth(r, "allow") == "GET, HEAD"
+}
+
+test_missing_404 := assert handler(mkreq("GET", "/nope.txt")) =
+  { status: 404, body: "not found" }
+
+test_traversal_403 := assert handler(mkreq("GET", "/../secret")) =
+  { status: 403, body: "forbidden" }
+
+test_encoded_traversal_403 := assert handler(
+  mkreq("GET", "/%2e%2e/etc/passwd")) =
+  { status: 403, body: "forbidden" }
+
+test_dotfile_hidden_404 := assert handler(mkreq("GET", "/.hidden")) =
+  { status: 404, body: "not found" }
+
+test_percent_encoded_name := assert do {
+  r := handler(mkreq("GET", "/a%20b.txt"))
+  r.status == 200 && body(r) == "space file"
+}
+
+-- ---------------------------------------------------------------------
+-- index resolution / directory handling
+-- ---------------------------------------------------------------------
+
+test_root_index := assert do {
+  r := handler(mkreq("GET", "/"))
+  r.status == 200 && body(r) == "<h1>hi</h1>"
+}
+
+test_dir_redirect := assert do {
+  r := handler(mkreq("GET", "/sub"))
+  r.status == 301 && geth(r, "location") == "/sub/"
+}
+
+test_dir_index := assert do {
+  r := handler(mkreq("GET", "/sub/"))
+  r.status == 200 && body(r) == "<h1>sub</h1>" &&
+  geth(r, "content-type") == "text/html; charset=utf-8"
+}
+
+-- a directory with no index file and listing off -> 403
+handler_nolisting := sf.static_files("/srv/www",
+  { fs: { stat: fs_stat,
+         read_file: fake_fs.read_file,
+         list_dir: (p) ~> if p == "/srv/www/bare" {
+           ["a.txt"] } else { fake_fs.list_dir(p) },
+         is_dir: (p) ~> hash_map.has(dirs, p) || p == "/srv/www/bare",
+         is_file: fake_fs.is_file } })
+
+test_bare_dir_403 := assert handler_nolisting(
+  mkreq("GET", "/bare/")) = { status: 403, body: "forbidden" }
+
+-- listing on still yields to a real index.html
+test_listing_yields_to_index := assert do {
+  r := sf.static_files("/srv/www", { fs: fake_fs, listing: true })(
+    mkreq("GET", "/"))
+  -- "/" has index.html -> file wins over listing
+  r.status == 200 && body(r) == "<h1>hi</h1>"
+}
+
+-- listing for a dir without index: build a fs where /srv/www/listme
+-- exists with files but no index.html
+listme_fs := {
+  stat: (p) ~> if p == "/srv/www/listme/b.txt" {
+    { size: 1, mtime_ms: 0, is_file: true, is_dir: false,
+      is_symlink: false }
+  } else if p == "/srv/www/listme/a<c>.txt" {
+    { size: 1, mtime_ms: 0, is_file: true, is_dir: false,
+      is_symlink: false }
+  } else {
+    fs_stat(p)
+  },
+  read_file: (p) ~> if p == "/srv/www/listme/b.txt"
+    || p == "/srv/www/listme/a<c>.txt" {
+    bytes.utf8_encode("x")
+  } else {
+    fake_fs.read_file(p)
+  },
+  list_dir: (p) ~> if p == "/srv/www/listme" {
+    ["b.txt", "a<c>.txt"]
+  } else {
+    fake_fs.list_dir(p)
+  },
+  is_dir: (p) ~> p == "/srv/www/listme" || hash_map.has(dirs, p),
+  is_file: (p) ~> p == "/srv/www/listme/b.txt"
+    || p == "/srv/www/listme/a<c>.txt" || hash_map.has(files, p)
+}
+
+list_handler := sf.static_files("/srv/www",
+  { fs: listme_fs, listing: true })
+
+test_listing_html := assert do {
+  r := list_handler(mkreq("GET", "/listme/"))
+  r.status == 200 &&
+  geth(r, "content-type") == "text/html; charset=utf-8" &&
+  str.find(body(r), "a&lt;c&gt;.txt") >= 0 &&
+  str.find(body(r), "b.txt") >= 0 &&
+  str.find(body(r), "Index of /listme/") >= 0
+}
+
+test_listing_off_403 := assert sf.static_files("/srv/www",
+  { fs: listme_fs })(mkreq("GET", "/listme/")) =
+  { status: 403, body: "forbidden" }
+
+-- ---------------------------------------------------------------------
+-- ETag / If-None-Match -> 304
+-- ---------------------------------------------------------------------
+
+test_etag_304 := assert do {
+  r1 := handler(mkreq("GET", "/hello.txt"))
+  et := geth(r1, "etag")
+  r2 := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "if-none-match", et)))
+  r2.status == 304 &&
+  hash_map.get_or(r2, "body_bytes", null) == null
+}
+
+test_etag_304_star := assert do {
+  r1 := handler(mkreq("GET", "/hello.txt"))
+  et := geth(r1, "etag")
+  _ := et
+  r2 := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "if-none-match", "*")))
+  r2.status == 304
+}
+
+test_etag_mismatch_200 := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "if-none-match", "W/\"999-1\"")))
+  r.status == 200
+}
+
+test_etag_weak_prefix := assert do {
+  r1 := handler(mkreq("GET", "/hello.txt"))
+  et := geth(r1, "etag")
+  core := str.slice(et, 2, str.length(et))
+  r2 := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "if-none-match", core)))
+  r2.status == 304
+}
+
+-- ---------------------------------------------------------------------
+-- Range -> 206 / 416
+-- ---------------------------------------------------------------------
+
+test_range_206 := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "bytes=0-4")))
+  r.status == 206 && body(r) == "hello" &&
+  geth(r, "content-range") == "bytes 0-4/11"
+}
+
+test_range_open_end := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "bytes=6-")))
+  r.status == 206 && body(r) == "world"
+}
+
+test_range_suffix := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "bytes=-5")))
+  r.status == 206 && body(r) == "world"
+}
+
+test_range_past_end_clamped := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "bytes=8-100")))
+  r.status == 206 && body(r) == "rld" &&
+  geth(r, "content-range") == "bytes 8-10/11"
+}
+
+test_range_unsatisfiable_416 := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "bytes=99-")))
+  r.status == 416 &&
+  geth(r, "content-range") == "bytes */11"
+}
+
+test_range_multipart_ignored := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "bytes=0-1,3-4")))
+  r.status == 200 && body(r) == "hello world"
+}
+
+test_range_garbage_ignored := assert do {
+  r := handler(mkreqh("GET", "/hello.txt",
+    hash_map.set({}, "range", "items=0-4")))
+  r.status == 200
+}
+
+-- ---------------------------------------------------------------------
+-- misc
+-- ---------------------------------------------------------------------
+
+test_extra_headers_opt := assert do {
+  h := sf.static_files("/srv/www", { fs: fake_fs,
+    headers: { "x-frame-options": "DENY" } })
+  r := h(mkreq("GET", "/hello.txt"))
+  r.status == 200 && geth(r, "x-frame-options") == "DENY" &&
+  geth(r, "content-type") == "text/plain; charset=utf-8"
+}
+
+test_bad_root_raises := assert match error.try(
+  (x) ~> sf.static_files(42)) {
+  err(e): true, ok(_): false }
+
+test_bad_fs_raises := assert match error.try(
+  (x) ~> sf.static_files("/srv/www", { fs: {} })) {
+  err(e): true, ok(_): false }
+
+test_symlink_rejected := assert do {
+  link_fs := hash_map.merge(fake_fs, {
+    lstat: (p) ~> if p == "/srv/www/link.txt" {
+      { is_symlink: true }
+    } else {
+      fs_stat(p)
+    },
+    is_file: (p) ~> p == "/srv/www/link.txt" ||
+      hash_map.has(files, p),
+    stat: (p) ~> if p == "/srv/www/link.txt" {
+      { size: 4, mtime_ms: 0, is_file: true, is_dir: false,
+        is_symlink: true }
+    } else {
+      fs_stat(p)
+    },
+    read_file: (p) ~> if p == "/srv/www/link.txt" {
+      bytes.utf8_encode("evil")
+    } else {
+      fake_fs.read_file(p)
+    }
+  })
+  h := sf.static_files("/srv/www", { fs: link_fs })
+  h(mkreq("GET", "/link.txt")).status == 403
+}
+
+-- ---------------------------------------------------------------------
+-- real-fs smoke: the built-in ffi fs port against /etc/hosts
+-- (linux/x86_64 dogfood host; skipped semantics if the file is absent)
+-- ---------------------------------------------------------------------
+
+test_builtin_fs_stat := assert do {
+  s := sf.default_fs.stat("/etc/hosts")
+  s.is_file == true && s.size > 0
+}
+
+test_builtin_fs_serve := assert do {
+  h := sf.static_files("/etc")
+  resp := h(mkreq("GET", "/hosts"))
+  resp.status == 200 && resp.body_bytes != null
+}
+
+test_builtin_fs_traversal := assert do {
+  h := sf.static_files("/etc")
+  h(mkreq("GET", "/../etc/passwd")).status == 403
+}
