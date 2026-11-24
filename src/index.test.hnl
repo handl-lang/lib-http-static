@@ -92,63 +92,63 @@ body := (resp) ~> do {
 -- safe_rel: percent-decoding + segment normalization
 -- ---------------------------------------------------------------------
 
-test_safe_rel_plain := assert sf.safe_rel("/a/b/c.txt") =
+test_safe_rel_plain := assert sf.safe_rel("/a/b/c.txt") ==
   { ok: true, segs: ["a", "b", "c.txt"] }
 
-test_safe_rel_dot_segments := assert sf.safe_rel("/a/./b//c") =
+test_safe_rel_dot_segments := assert sf.safe_rel("/a/./b//c") ==
   { ok: true, segs: ["a", "b", "c"] }
 
-test_safe_rel_traversal := assert sf.safe_rel("/../etc/passwd") =
+test_safe_rel_traversal := assert sf.safe_rel("/../etc/passwd") ==
   { ok: false, code: 403 }
 
-test_safe_rel_nested_traversal := assert sf.safe_rel("/a/../../b") =
+test_safe_rel_nested_traversal := assert sf.safe_rel("/a/../../b") ==
   { ok: false, code: 403 }
 
 test_safe_rel_encoded_traversal := assert sf.safe_rel(
-  "/a/%2e%2e/%2E%2E/b") = { ok: false, code: 403 }
+  "/a/%2e%2e/%2E%2E/b") == { ok: false, code: 403 }
 
-test_safe_rel_encoded_slash := assert sf.safe_rel("/a%2Fb/c") =
+test_safe_rel_encoded_slash := assert sf.safe_rel("/a%2Fb/c") ==
   { ok: true, segs: ["a", "b", "c"] }
 
-test_safe_rel_encoded_dotfile := assert sf.safe_rel("/%2ehidden") =
+test_safe_rel_encoded_dotfile := assert sf.safe_rel("/%2ehidden") ==
   { ok: true, segs: [".hidden"] }
 
-test_safe_rel_nul := assert sf.safe_rel("/a%00b") =
+test_safe_rel_nul := assert sf.safe_rel("/a%00b") ==
   { ok: false, code: 403 }
 
-test_safe_rel_bad_escape := assert sf.safe_rel("/a%zz") =
+test_safe_rel_bad_escape := assert sf.safe_rel("/a%zz") ==
   { ok: false, code: 400 }
 
-test_safe_rel_truncated_escape := assert sf.safe_rel("/a%2") =
+test_safe_rel_truncated_escape := assert sf.safe_rel("/a%2") ==
   { ok: false, code: 400 }
 
-test_safe_rel_root := assert sf.safe_rel("/") =
+test_safe_rel_root := assert sf.safe_rel("/") ==
   { ok: true, segs: [] }
 
 -- ---------------------------------------------------------------------
 -- mime_of / http_date
 -- ---------------------------------------------------------------------
 
-test_mime_html := assert sf.mime_of("/x/index.html") =
+test_mime_html := assert sf.mime_of("/x/index.html") ==
   "text/html; charset=utf-8"
 
-test_mime_js := assert sf.mime_of("/x/app.js") =
+test_mime_js := assert sf.mime_of("/x/app.js") ==
   "text/javascript; charset=utf-8"
 
-test_mime_png := assert sf.mime_of("/x/logo.PNG") = "image/png"
+test_mime_png := assert sf.mime_of("/x/logo.PNG") == "image/png"
 
-test_mime_wasm := assert sf.mime_of("/x/mod.wasm") = "application/wasm"
+test_mime_wasm := assert sf.mime_of("/x/mod.wasm") == "application/wasm"
 
-test_mime_unknown := assert sf.mime_of("/x/blob.bin") =
+test_mime_unknown := assert sf.mime_of("/x/blob.bin") ==
   "application/octet-stream"
 
-test_mime_no_ext := assert sf.mime_of("/x/Makefile") =
+test_mime_no_ext := assert sf.mime_of("/x/Makefile") ==
   "application/octet-stream"
 
-test_http_date_epoch := assert sf.http_date(0) =
+test_http_date_epoch := assert sf.http_date(0) ==
   "Thu, 01 Jan 1970 00:00:00 GMT"
 
-test_http_date_known := assert sf.http_date(784111777000) =
+test_http_date_known := assert sf.http_date(784111777000) ==
   "Sun, 06 Nov 1994 08:49:37 GMT"
 
 -- ---------------------------------------------------------------------
@@ -194,17 +194,17 @@ test_post_405 := assert do {
   r.status == 405 && geth(r, "allow") == "GET, HEAD"
 }
 
-test_missing_404 := assert handler(mkreq("GET", "/nope.txt")) =
+test_missing_404 := assert handler(mkreq("GET", "/nope.txt")) ==
   { status: 404, body: "not found" }
 
-test_traversal_403 := assert handler(mkreq("GET", "/../secret")) =
+test_traversal_403 := assert handler(mkreq("GET", "/../secret")) ==
   { status: 403, body: "forbidden" }
 
 test_encoded_traversal_403 := assert handler(
-  mkreq("GET", "/%2e%2e/etc/passwd")) =
+  mkreq("GET", "/%2e%2e/etc/passwd")) ==
   { status: 403, body: "forbidden" }
 
-test_dotfile_hidden_404 := assert handler(mkreq("GET", "/.hidden")) =
+test_dotfile_hidden_404 := assert handler(mkreq("GET", "/.hidden")) ==
   { status: 404, body: "not found" }
 
 test_percent_encoded_name := assert do {
@@ -242,7 +242,7 @@ handler_nolisting := sf.static_files("/srv/www",
          is_file: fake_fs.is_file } })
 
 test_bare_dir_403 := assert handler_nolisting(
-  mkreq("GET", "/bare/")) = { status: 403, body: "forbidden" }
+  mkreq("GET", "/bare/")) == { status: 403, body: "forbidden" }
 
 -- listing on still yields to a real index.html
 test_listing_yields_to_index := assert do {
@@ -293,7 +293,7 @@ test_listing_html := assert do {
 }
 
 test_listing_off_403 := assert sf.static_files("/srv/www",
-  { fs: listme_fs })(mkreq("GET", "/listme/")) =
+  { fs: listme_fs })(mkreq("GET", "/listme/")) ==
   { status: 403, body: "forbidden" }
 
 -- ---------------------------------------------------------------------
